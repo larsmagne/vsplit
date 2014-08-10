@@ -7,13 +7,26 @@
 #include <unistd.h>
 #include <strings.h>
 
-#define BUFFER_SIZE 0x200000
+#define BUFFER_SIZE 0x50000
 
-int limit = 20;
+int limit = 8;
 char *output = "output";
-int avglen = 1000;
+int avglen = 44100;
 int verbose = 0;
-int spread = 1000;
+int spread = 2;
+
+int max (int a, int b) {
+  return (a > b? a: b);
+}
+
+int min (int a, int b) {
+  return (a < b? a: b);
+}
+
+void sprint (char *type, int count, int part) {
+  int c = count / (44100*2*2);
+  fprintf (stderr, "%02d:%02d %02d %s\n", c / 60, c % 60, part, type);
+}
 
 void sp_write (int fd, void *buf, int count) {
   int l, start = 0, block;
@@ -24,6 +37,7 @@ void sp_write (int fd, void *buf, int count) {
       block = count;
     if ((l = write (fd, (char*)(buf + start), block)) < 0) {
       perror ("vsplit write");
+      printf ("%x %x %x\n", fd, (unsigned int)buf, count);
       exit (-1);
     }
     start += l;
@@ -31,52 +45,23 @@ void sp_write (int fd, void *buf, int count) {
   }
 }						   
 
-
-void chop (int in, int start, int stop, int part) {
-  short *buf;
-  int count = start;
-  int max = BUFFER_SIZE * sizeof(short);
-  char *sbuf = (char*)malloc(1000);
-  int out, len;
-
-  fprintf (stderr, "%d: Chopping from %d to %d.\n", part, start, stop);
-  
-  if (! (buf = (short *) malloc (BUFFER_SIZE * sizeof(short)))) {
-    perror ("vsplit");
-    exit (-1);
-  }
-
-  if (lseek (in, start, SEEK_SET) < 0) {
-    perror ("vsplit");
-    exit (-1);
-  }
-    
-  sprintf (sbuf, "%s-%02d.raw", output, part);
-  if ((out = open (sbuf, O_RDWR | O_CREAT | O_TRUNC, 0644)) < 0) {
-    perror ("vsplit");
-    exit (-1);
-  }
-
-  while (count < stop) {
-    len = read (in, buf, (max < stop - count? max: stop - count));
-    count += len;
-    sp_write (out, buf, len);
-  }
-
-  close (out);
-  free (sbuf);
-  free (buf);
-}
-
 void split (char *file) {
   short *buf, *avgbuf;
-  int avgb = 0;
+  int avgb = 1;
   int in, len, in_song = 0, b;
-  float avg = 0;
+  int highest = 0;
+  int high_val = 0;
+  unsigned int avg = 0;
   int count = 0, close_pos = 0, end_pos = 0, split_pos = 0, start_pos = 0;
-  int gracelen = 44100 * 2 * 2 * 1.5, i;
+  int gracelen = 44100 * 2 * 2 * 1.5;
   int seq = -1, below = 0;
   int stop[1000], start[1000];
+  int part = 1;
+  char *sbuf = (char*)malloc(1000);
+  int block_start = 0, out = 0, write_start = 0;
+  unsigned int limit_minus_spread = (limit - spread) * avglen,
+    limit_plus_spread = (limit + spread) * avglen,
+    proper_limit = limit * avglen;
   
   if (! (buf = (short *) malloc (BUFFER_SIZE * sizeof(short)))) {
     perror ("vsplit");
@@ -94,31 +79,43 @@ void split (char *file) {
     exit (-1);
   }
 
+read_more:
   while ((len = read (in, buf, BUFFER_SIZE * sizeof(short))) > 0) {
     b = 0;
     len /= 2;
+    block_start = count;
     while (b < len) {
-      avg -= (float)(abs(avgbuf[avgb+1]-avgbuf[avgb])) / avglen;
+      if (abs(buf[b]) > high_val)
+	high_val = abs(buf[b]);
+      if (buf[b] == 32767) {
+	highest++;
+      }
+      avg -= abs(avgbuf[avgb+1]-avgbuf[avgb]);
       avgbuf[avgb++] = buf[b];
-      avg += (float)(abs(avgbuf[avgb-1]-avgbuf[avgb-2])) / avglen;
-
+      avg += abs(avgbuf[avgb-1]-avgbuf[avgb-2]);
+      
       if (avgb >= avglen)
-	avgb = 0;
+	avgb = 1;
 
-      if (! (count % (44100*2*2)))
-	fprintf (stderr, "%d: %.2f\n", count/(44100*2*2), avg);
+      /*
+      if (! (count % (44100*2*2))) {
+	int c = count / (44100*2*2);
+	fprintf (stderr, "%02d:%02d %.2f\n", c / 60, c % 60,
+		 (float)avg / avglen);
+      }
+      */
 
       count += 4;
 
       if (in_song) {
-	if (avg < limit - spread) {
-	  if (below >= 44100 / 4) {
+	if (avg < limit_minus_spread) {
+	  if (below >= 44100 / 2) {
 	    in_song = 0;
 	    close_pos = 0;
 	  } else {
 	    if (! end_pos) {
-	      fprintf (stderr, "*** End found: %ds. %.2f %d ***\n",
-		       count / (44100 * 2 * 2), avg, below);
+	      below = 0;
+	      sprint ("End", count, part-1);
 	      end_pos = count;
 	    }
 	    below++;
@@ -130,16 +127,15 @@ void split (char *file) {
       } else {
 	if (end_pos && (! close_pos) &&
 	    (count - gracelen > end_pos ||
-	     avg > limit)) {
-	  fprintf (stderr, "*** Closing track: %ds. ***\n",
-		   count / (44100 * 2 * 2));
+	     avg > proper_limit)) {
+	  sprint ("Close", count, part-1);
 	  close_pos = count;
 	}
-	if (avg > limit + spread) {
+	if (avg > limit_plus_spread) {
 	  in_song = 1;
+	  below = 0;
 	  start_pos = count;
-	  fprintf (stderr, "*** Start found: %ds. ***\n",
-		   count / (44100 * 2 * 2));
+	  sprint ("Start", count, part);
 	  /* Compute split_pos based on start_pos, end_pos and close_pos. */
 	  if (close_pos) {
 	    /* We have found the closing point. */
@@ -155,16 +151,46 @@ void split (char *file) {
 	    stop[seq] = split_pos;
 	  } else {
 	    /* First track. */
-	    split_pos = (start_pos - gracelen > 0?
-			 start_pos - gracelen: 0);
-	  } 
+	    split_pos = (start_pos -
+			 (gracelen > 0)? start_pos - gracelen: 0);
+	  }
+
+	  if (out) {
+	    if (stop[seq] < block_start) {
+	      ftruncate (out, stop[seq] - write_start);
+	    } else {
+	      sp_write (out, (char*)((unsigned int)buf +
+				     max (write_start - block_start, 0)),
+			(stop[seq] - max (block_start, write_start)));
+	    }
+	    close (out);
+	    out = 0;
+	  }
+	  		
+	  sprintf (sbuf, "%s-%02d.raw", output, part++);
+	  if ((out = open (sbuf, O_RDWR | O_CREAT | O_TRUNC, 0644)) < 0) {
+	    perror ("vsplit");
+	    exit (-1);
+	  }
+	  
 	  seq++;
 	  start[seq] = split_pos;
+	  write_start = split_pos;
 	  end_pos = 0;
 	  close_pos = 0;
+	  if (split_pos < block_start) {
+	    lseek (in, split_pos, SEEK_SET);
+	    count = split_pos;
+	    goto read_more;
+	  }
 	}
       } 
       b += 2;
+    }
+    if (out) {
+      sp_write (out, (char*) ((unsigned int)buf
+			      + max (write_start - block_start, 0)),
+		(count - max (block_start, write_start)));
     }
   }
   if (len == -1) {
@@ -176,38 +202,30 @@ void split (char *file) {
   if (close_pos) {
     stop[seq] = close_pos;
   } else if (end_pos) {
-    stop[seq] = (end_pos + gracelen > count? count: end_pos + gracelen);
+    stop[seq] = (end_pos + (gracelen > count)? count: end_pos + gracelen);
   } else {
     stop[seq] = count;
   }
 
-  for (i=0; i <= seq; i++) 
-    chop (in, start[i], stop[i], i+1);
-
-  printf ("%d %d %d\n", i+1, start[i], stop[i]);
-  
-}
-
-void chop_loop (char *file, char *split) {
-  int in, part = 0;
-  char *s;
-  
-  if (! (in = open (file, O_RDONLY))) {
-    perror ("vsplit");
-    exit (-1);
+  if (out) {
+    if (stop[seq] < block_start) {
+      ftruncate (out, stop[seq] - write_start);
+    } else if (in_song) {
+      sp_write (out, (char*) ((unsigned int) buf +
+			      max (write_start - block_start, 0)),
+		(stop[seq] - max (block_start, write_start)));
+    }
+    close (out);
+    out = 0;
   }
 
-  s = strtok (split, ",");
-  while (s) {
-    chop (in, atoi (s), atoi (strchr (s, '.') + 1), part++);
-    s = strtok (NULL, ",");
-  }
+  printf ("We had %d highest (%d).\n", highest, high_val);
+  
 }
-
 
 int main (int argc, char **argv) {
   int c;
-  char *file, *chop_arg = 0;
+  char *file;
   
   while (1) {
     int option_index = 0;
@@ -218,7 +236,6 @@ int main (int argc, char **argv) {
       {"output", 1, 0, 'o'},
       {"verbose", 1, 0, 'v'},
       {"spread", 1, 0, 's'},
-      {"chop", 1, 0, 'c'},
       {0, 0, 0, 0}
     };
 
@@ -230,7 +247,15 @@ int main (int argc, char **argv) {
     case 'h':
       printf ("\
 Usage: vsplit [--help] [--floor <limit>] [--length <length>]
-              [--output <output_file>] <file>\n");
+              [--output <output_file>] [--spread <number] <file>
+
+--floor specifies the noise floor
+--length says how long a pause is (in seconds)
+--spread specifies how much above/below the floor a song is\n
+
+Reasonable values are:
+
+vsplit -f 15 -s 2 -l 0.5 -o output.raw input.raw");
       break;
 
     case 'f':
@@ -259,10 +284,7 @@ Usage: vsplit [--help] [--floor <limit>] [--length <length>]
     file = argv[optind];
   }
 
-  if (chop_arg)
-    chop_loop (file, chop_arg);
-  else 
-    split (file);
+  split (file);
   
   return (0);
 }
