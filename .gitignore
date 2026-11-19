@@ -1,0 +1,9 @@
+Makefile*
+aclocal*
+config*
+stamp*
+*.o
+.deps
+vsplit
+autom4te.cache
+build-aux
